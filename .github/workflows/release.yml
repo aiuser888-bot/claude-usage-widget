@@ -1,0 +1,40 @@
+name: Auto tag & release
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION, CITATION.cff, .github/workflows/release.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: v
+        run: |
+          if [ -f VERSION ]; then
+            v=$(tr -d ' \r\n' < VERSION)
+          else
+            v=$(grep -E '^version:' CITATION.cff | head -1 | sed -E 's/^version:[[:space:]]*"?([^"]+)"?.*/\1/' | tr -d '\r')
+          fi
+          [ -n "$v" ] || { echo "::error::no version found in VERSION or CITATION.cff"; exit 1; }
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "$TAG already exists, skipping"
+            exit 0
+          fi
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes
