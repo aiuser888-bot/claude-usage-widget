@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+claude_usage_state.json
+widget.log
+widget_status.json
+setup.log
+*.lnk
