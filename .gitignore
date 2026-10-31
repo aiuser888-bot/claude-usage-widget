@@ -5,3 +5,4 @@ widget.log
 widget_status.json
 setup.log
 *.lnk
+.show_request

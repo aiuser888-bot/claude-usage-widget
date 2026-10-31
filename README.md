@@ -68,7 +68,7 @@ pythonw claude_usage_widget.py
 
 - **顯示「驗證失敗」**：sessionKey 過期或已登出，右鍵 →「更換 sessionKey」重新貼上。
 - **顯示「被 Cloudflare 擋下」**：通常是暫時性的，稍後自動重試；持續發生請更新 `curl_cffi`。
-- **小窗沒出現**：查看 `widget.log`；確認工作管理員中沒有殘留的 `pythonw.exe`。
+- **小窗不見了**（例如按了 Win+D「顯示桌面」或螢幕配置改變）：再點一次桌面捷徑即可，執行中的小窗會在 5 秒內自動回到主螢幕右下角；小窗每 5 秒也會自行檢查並拉回畫面內。仍無效再查看 `widget.log`。
 - **API 格式改變導致無資料**：`widget.log` 會記錄回應的欄位名稱，歡迎開 issue。
 
 ## 隱私

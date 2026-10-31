@@ -19,6 +19,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "claude_usage_state.json"
 LOG_FILE = HERE / "widget.log"
+SHOW_FLAG = HERE / ".show_request"  # 第二次啟動時建立，通知執行中的小窗回到畫面上
 
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, encoding="utf-8",
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -96,18 +97,22 @@ def countdown(iso):
     return (f"{d}天 " if d else "") + (f"{h}時 " if d or h else "") + f"{m}分後重置"
 
 
-def on_screen(x, y, sw, sh):
-    """左上角附近的點是否落在任一台螢幕上；Windows 用 MonitorFromPoint 判斷，支援負座標的副螢幕。"""
+def _point_on_monitor(x, y):
+    import ctypes
+    from ctypes import wintypes
+    f = ctypes.windll.user32.MonitorFromPoint
+    f.argtypes, f.restype = [wintypes.POINT, wintypes.DWORD], wintypes.HMONITOR
+    return bool(f(wintypes.POINT(int(x), int(y)), 0))  # MONITOR_DEFAULTTONULL
+
+
+def on_screen(x, y, sw, sh, w=240, h=60):
+    """視窗左上與右下附近是否都落在某台螢幕上（支援負座標的副螢幕、解析度或螢幕配置改變）。"""
     if sys.platform == "win32":
         try:
-            import ctypes
-            from ctypes import wintypes
-            f = ctypes.windll.user32.MonitorFromPoint
-            f.argtypes, f.restype = [wintypes.POINT, wintypes.DWORD], wintypes.HMONITOR
-            return bool(f(wintypes.POINT(int(x) + 20, int(y) + 10), 0))  # MONITOR_DEFAULTTONULL
+            return _point_on_monitor(x + 20, y + 10) and _point_on_monitor(x + w - 20, y + min(h, 60) - 10)
         except Exception:
             pass
-    return 0 <= x < sw - 40 and 0 <= y < sh - 40
+    return 0 <= x and x + w <= sw and 0 <= y and y + min(h, 60) <= sh
 
 
 class AuthError(RuntimeError):
@@ -216,6 +221,7 @@ class Widget:
         self.client = UsageClient(key)
         self.rows, self.err, self.last = [], None, None
         self.fetching = False
+        self.had_error = False
         st = load_json(STATE_FILE, {})
         self.collapsed = st.get("collapsed", False)
         self.alpha = st.get("alpha", 0.92)
@@ -279,7 +285,10 @@ class Widget:
         if err:
             log.warning("fetch error: %s", err)
         else:
+            if self.last is None or self.had_error:
+                log.info("fetch ok: %s", ", ".join(f"{l} {round(p)}%" for l, p, _ in rows))
             self.last = datetime.now()
+        self.had_error = bool(err)
         self.render()
         if isinstance(err, AuthError):
             self.root.after(200, lambda: self.change_key("sessionKey 已失效，請重新貼上"))
@@ -291,12 +300,38 @@ class Widget:
         self.root.after(30_000, self._tick)
 
     def _keep_on_top(self):
+        """每 5 秒：保持置頂、從最小化（例如 Win+D）還原、螢幕配置改變時拉回畫面內、回應重複啟動。"""
         try:
+            if SHOW_FLAG.exists():
+                try:
+                    SHOW_FLAG.unlink()
+                except Exception:
+                    pass
+                log.info("show request from second launch")
+                self.reset_position()
+            if self.root.state() != "normal":
+                self.root.deiconify()
+            self.root.update_idletasks()
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+            if not on_screen(x, y, self.root.winfo_screenwidth(), self.root.winfo_screenheight(), w, h):
+                log.info("window off-screen at (%s,%s) size %sx%s, moving back", x, y, w, h)
+                self.reset_position()
             self.root.attributes("-topmost", True)
             self.root.lift()
         except Exception:
-            pass
+            log.exception("keep_on_top failed")
         self.root.after(5000, self._keep_on_top)
+
+    def reset_position(self):
+        """移到主螢幕右下角（工作列上方）。"""
+        self.root.update_idletasks()
+        w, h = max(self.root.winfo_width(), 240), max(self.root.winfo_height(), 60)
+        x = max(0, self.root.winfo_screenwidth() - w - 20)
+        y = max(0, self.root.winfo_screenheight() - h - 60)
+        self.root.deiconify()
+        self.root.geometry(f"+{x}+{y}")
+        self.save_state(x, y)
 
     # ---------- 畫面 ----------
     def render(self):
@@ -366,8 +401,8 @@ class Widget:
             self._drag = None
             self.save_state()
 
-    def save_state(self):
-        save_json(STATE_FILE, {"x": self.root.winfo_x(), "y": self.root.winfo_y(),
+    def save_state(self, x=None, y=None):
+        save_json(STATE_FILE, {"x": self.root.winfo_x() if x is None else x, "y": self.root.winfo_y() if y is None else y,
                                "collapsed": self.collapsed, "alpha": self.alpha})
 
     def quit(self):
@@ -396,7 +431,11 @@ def main():
         except Exception:
             pass
     if not single_instance():
-        log.info("already running, exit")
+        try:
+            SHOW_FLAG.write_text("1", encoding="utf-8")  # 通知執行中的小窗回到畫面上
+        except Exception:
+            pass
+        log.info("already running, asked existing window to show itself")
         return
     log.info("widget start")
     key = get_key()
