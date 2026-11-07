@@ -96,6 +96,7 @@ pythonw claude_usage_widget.py
 | `uninstall.bat` / `uninstall.ps1` | 移除腳本 |
 | `requirements.txt` | Python 相依套件 |
 | `usage_query.py` | 用量紀錄查詢工具 |
+| `USAGE_FOR_AI.md` | 給其他 AI 對話的查詢工具使用說明 |
 | `claude_usage_state.json` | （執行時產生）視窗位置等設定 |
 | `usage_history/` | （執行時產生）用量紀錄與標記 |
 | `widget.log` | （執行時產生）啟動與錯誤紀錄 |
