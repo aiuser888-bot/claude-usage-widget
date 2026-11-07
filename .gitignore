@@ -6,3 +6,5 @@ widget_status.json
 setup.log
 *.lnk
 .show_request
+usage_history/
+.refresh_request

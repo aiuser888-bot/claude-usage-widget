@@ -6,6 +6,8 @@ https://github.com/aiuser888-bot/claude-usage-widget  ·  MIT License
 - sessionKey 存放在 Windows 認證管理員（keyring），不落地成明文檔案
 - 左鍵拖曳移動 / 雙擊收合 / 右鍵選單：立即更新、收合展開、透明度、更換 sessionKey、結束
 - 錯誤寫入 widget.log（不含 sessionKey）；視窗位置等設定存在 claude_usage_state.json
+- 每次更新都把時間與用量寫入 usage_history/usage_YYYY-MM-DD.jsonl（總量上限 500 MB，超過刪最舊的檔）；
+  其他程式可用 usage_query.py 查詢，或建立 .refresh_request 要求立即更新
 """
 
 import json
@@ -13,6 +15,7 @@ import logging
 import sys
 import threading
 import tkinter as tk
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +23,9 @@ HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "claude_usage_state.json"
 LOG_FILE = HERE / "widget.log"
 SHOW_FLAG = HERE / ".show_request"  # 第二次啟動時建立，通知執行中的小窗回到畫面上
+REFRESH_FLAG = HERE / ".refresh_request"  # 外部程式建立，要求小窗立即更新一次（usage_query.py snapshot 用）
+HISTORY_DIR = HERE / "usage_history"
+HISTORY_MAX_BYTES = 500 * 1024 * 1024
 
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, encoding="utf-8",
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -115,6 +121,41 @@ def on_screen(x, y, sw, sh, w=240, h=60):
     return 0 <= x and x + w <= sw and 0 <= y and y + min(h, 60) <= sh
 
 
+class UsageHistory:
+    """用量紀錄：每次更新寫一行 JSON 到 usage_history/usage_YYYY-MM-DD.jsonl；總量超過上限時刪除最舊的檔案。"""
+
+    def __init__(self, folder=HISTORY_DIR, max_bytes=HISTORY_MAX_BYTES):
+        self.folder, self.max_bytes, self.writes = Path(folder), max_bytes, 0
+        try:
+            self.folder.mkdir(exist_ok=True)
+        except Exception:
+            log.exception("cannot create history folder")
+        self.prune()
+
+    def append(self, record):
+        try:
+            day = datetime.now().strftime("%Y-%m-%d")
+            with open(self.folder / f"usage_{day}.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            self.writes += 1
+            if self.writes % 60 == 0:
+                self.prune()
+        except Exception:
+            log.exception("history write failed")
+
+    def prune(self):
+        try:
+            files = sorted(self.folder.glob("usage_*.jsonl"))
+            total = sum(f.stat().st_size for f in files)
+            while total > self.max_bytes and len(files) > 1:
+                old = files.pop(0)
+                total -= old.stat().st_size
+                old.unlink()
+                log.info("history pruned %s", old.name)
+        except Exception:
+            log.exception("history prune failed")
+
+
 class AuthError(RuntimeError):
     pass
 
@@ -124,6 +165,7 @@ class UsageClient:
         self.s = requests.Session(impersonate="chrome")
         self.s.cookies.set("sessionKey", session_key, domain=".claude.ai")
         self.org = None
+        self.last_raw = {}
 
     def _get(self, path):
         r = self.s.get(BASE + path, timeout=20, headers={"Accept": "application/json"})
@@ -147,13 +189,15 @@ class UsageClient:
             org = next((o for o in orgs if "chat" in (o.get("capabilities") or [])), orgs[0])
             self.org = org["uuid"]
         data = self._get(f"/api/organizations/{self.org}/usage")
-        rows = []
+        rows, raw = [], {}
         for k, v in (data or {}).items():
             if isinstance(v, dict) and v.get("utilization") is not None:
                 u = float(v["utilization"])
                 if u <= 1 and u % 1:
                     u *= 100
                 rows.append((LABELS.get(k, k), u, v.get("resets_at")))
+                raw[k] = {"pct": round(u, 2), "resets_at": v.get("resets_at")}
+        self.last_raw = raw
         if not rows:
             log.warning("usage response had no rows; keys=%s", list((data or {}).keys()))
         return rows
@@ -222,6 +266,8 @@ class Widget:
         self.rows, self.err, self.last = [], None, None
         self.fetching = False
         self.had_error = False
+        self.history = UsageHistory()
+        self.fetch_src = "timer"
         st = load_json(STATE_FILE, {})
         self.collapsed = st.get("collapsed", False)
         self.alpha = st.get("alpha", 0.92)
@@ -260,26 +306,33 @@ class Widget:
         self.root.bind_all("<Double-Button-1>", lambda e: self.toggle())
 
         self.render()
-        self.refresh()
+        self.refresh("start")
         self.root.after(30_000, self._tick)
         self.root.after(1000, self._keep_on_top)
+        self.root.after(1000, self._poll_flags)
 
     # ---------- 資料 ----------
-    def refresh(self):
+    def refresh(self, src="manual"):
         if self.fetching:
             return
         self.fetching = True
+        self.fetch_src = src
         threading.Thread(target=self._fetch, daemon=True).start()
 
     def _fetch(self):
+        raw = {}
         try:
             rows, err = self.client.usage(), None
+            raw = dict(self.client.last_raw)
         except Exception as e:
             rows, err = self.rows, e
-        self.root.after(0, self._apply, rows, err)
+        self.root.after(0, self._apply, rows, err, raw)
 
-    def _apply(self, rows, err):
+    def _apply(self, rows, err, raw=None):
         self.fetching = False
+        self.history.append({"t": datetime.now().astimezone().isoformat(timespec="seconds"), "ok": err is None,
+                             "src": self.fetch_src, "usage": raw or {}, "error": str(err) if err else None})
+        self.fetch_src = "timer"
         self.rows = rows
         self.err = str(err) if err else None
         if err:
@@ -296,19 +349,12 @@ class Widget:
     def _tick(self):
         self.render()
         if not self.last or (datetime.now() - self.last).total_seconds() >= REFRESH_SEC:
-            self.refresh()
+            self.refresh("timer")
         self.root.after(30_000, self._tick)
 
     def _keep_on_top(self):
         """每 5 秒：保持置頂、從最小化（例如 Win+D）還原、螢幕配置改變時拉回畫面內、回應重複啟動。"""
         try:
-            if SHOW_FLAG.exists():
-                try:
-                    SHOW_FLAG.unlink()
-                except Exception:
-                    pass
-                log.info("show request from second launch")
-                self.reset_position()
             if self.root.state() != "normal":
                 self.root.deiconify()
             self.root.update_idletasks()
@@ -322,6 +368,21 @@ class Widget:
         except Exception:
             log.exception("keep_on_top failed")
         self.root.after(5000, self._keep_on_top)
+
+    def _poll_flags(self):
+        """每秒檢查外部請求：.show_request（重複啟動）、.refresh_request（立即更新）。"""
+        for flag in (SHOW_FLAG, REFRESH_FLAG):
+            if flag.exists():
+                try:
+                    flag.unlink()
+                except Exception:
+                    pass
+                if flag is SHOW_FLAG:
+                    log.info("show request from second launch")
+                    self.reset_position()
+                else:
+                    self.refresh("request")
+        self.root.after(1000, self._poll_flags)
 
     def reset_position(self):
         """移到主螢幕右下角（工作列上方）。"""

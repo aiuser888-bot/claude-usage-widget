@@ -16,6 +16,40 @@ A tiny always-on-top Windows desktop widget that shows your claude.ai plan usage
 - 支援多螢幕，記住視窗位置、收合狀態、透明度
 - 防止重複開啟（Windows 具名 mutex）
 - 錯誤記錄在 `widget.log`（不含 sessionKey）
+- 每次更新寫入用量紀錄檔，附查詢工具 `usage_query.py`，可量測排程前後的用量消耗
+
+## 用量紀錄（給排程或其他程式使用）
+
+小窗每次更新（預設每 60 秒）都會把時間與用量寫進 `usage_history/usage_YYYY-MM-DD.jsonl`，一行一筆：
+
+```json
+{"t":"2026-11-07T09:30:00+08:00","ok":true,"src":"timer","usage":{"five_hour":{"pct":41.0,"resets_at":"..."},"seven_day":{"pct":13.0,"resets_at":"..."}},"error":null}
+```
+
+- 總量上限 500 MB，超過時自動刪除最舊的日檔（以每天約 1,440 筆估算，可保存數年）
+- 抓取失敗也會記一筆 `"ok": false`，方便判斷資料缺口
+- `src`：`timer`（定時）、`request`（外部要求）、`start`、`manual`
+
+### `usage_query.py`：查詢與量測排程前後的消耗
+
+只用 Python 標準函式庫，輸出 JSON。
+
+```bash
+python usage_query.py latest                      # 最新一筆
+python usage_query.py snapshot                    # 要求小窗立即更新，等新紀錄寫入後輸出
+python usage_query.py mark "job-A start"          # 立即更新並記下標記
+# ...執行排程...
+python usage_query.py mark "job-A end"
+python usage_query.py diff "mark:job-A start" "mark:job-A end"   # 兩點之間的消耗
+python usage_query.py diff now-2h now --metric five_hour
+python usage_query.py at "2026-11-07 09:00"
+python usage_query.py range now-30m now
+python usage_query.py marks --last 10
+```
+
+`diff` 會把各區段的百分比上升量加總；中途遇到額度重置（百分比下降）時，以重置後的百分比計入並回報 `resets_in_between`。API 提供的是整數百分比，解析度為 1 個百分點。
+
+`snapshot` / `mark` 透過在程式資料夾建立 `.refresh_request` 檔通知小窗，小窗每秒檢查一次，所以小窗必須在執行中。
 
 ## 操作
 
@@ -61,7 +95,9 @@ pythonw claude_usage_widget.py
 | `install.bat` / `install.ps1` | 安裝腳本 |
 | `uninstall.bat` / `uninstall.ps1` | 移除腳本 |
 | `requirements.txt` | Python 相依套件 |
+| `usage_query.py` | 用量紀錄查詢工具 |
 | `claude_usage_state.json` | （執行時產生）視窗位置等設定 |
+| `usage_history/` | （執行時產生）用量紀錄與標記 |
 | `widget.log` | （執行時產生）啟動與錯誤紀錄 |
 
 ## 疑難排解
