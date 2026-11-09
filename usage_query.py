@@ -14,6 +14,7 @@ usage_query.py — 查詢 Claude Usage Widget 寫下的用量紀錄（只用 Pyt
   diff FROM TO [--metric M ...]  兩個時間點之間的用量消耗（會處理中途額度重置）
   range FROM TO                  兩個時間點之間的所有紀錄
   marks [--last N]               列出最近的標記
+  convs [FROM TO] [--top N]      各對話的估計用量（預設最近 24 小時；依小窗記下的「有動的對話」分攤）
 
 FROM / TO / TIME 可以是：
   ISO 時間（例如 2026-11-07T09:00 或 "2026-11-07 09:00"；沒寫時區時，視為紀錄所用的時區）
@@ -251,6 +252,57 @@ def cmd_range(a):
     out({"from": t1.isoformat(), "to": t2.isoformat(), "records": [clean(r) for r in seq]})
 
 
+def cmd_convs(a):
+    """把每次百分比上升分攤給當時有動的對話：只有一個就全給它，多個則平分並標記 shared。"""
+    a.start, a.end = a.start or "now-1d", a.end or "now"
+    t1, t2, seq = window(a)
+    if not seq:
+        return out({"ok": False, "error": "no records in range"})
+    metrics = sorted({k for r in seq for k in r.get("usage", {})})
+    prev = {m: None for m in metrics}
+    convs, buckets = {}, {"unattributed": {}, "unknown": {}}
+    for i, r in enumerate(seq):
+        deltas = {}
+        for m in metrics:
+            cur = r.get("usage", {}).get(m, {}).get("pct")
+            if cur is None:
+                continue
+            if prev[m] is not None and i > 0:
+                d = cur - prev[m] if cur >= prev[m] else cur
+                if d > 0:
+                    deltas[m] = d
+            prev[m] = cur
+        if not deltas:
+            continue
+        if "active_convs" not in r:
+            target = [("unknown", None)]
+        elif not r["active_convs"]:
+            target = [("unattributed", None)]
+        else:
+            target = [(c["uuid"], c) for c in r["active_convs"]]
+        share = 1 / len(target)
+        for key, c in target:
+            if c is None:
+                b = buckets[key]
+                for m, d in deltas.items():
+                    b[m] = round(b.get(m, 0) + d * share, 2)
+                continue
+            e = convs.setdefault(key, {"uuid": key, "name": c.get("name"), "model": c.get("model"),
+                                       "used": {}, "events": 0, "shared_events": 0, "last_active": None})
+            e["name"] = c.get("name") or e["name"]
+            for m, d in deltas.items():
+                e["used"][m] = round(e["used"].get(m, 0) + d * share, 2)
+            e["events"] += 1
+            e["shared_events"] += len(target) > 1
+            e["last_active"] = c.get("updated_at") or e["last_active"]
+    ranked = sorted(convs.values(), key=lambda e: -sum(e["used"].values()))[: a.top]
+    out({"ok": True, "from": t1.isoformat(), "to": t2.isoformat(), "conversations": ranked,
+         "unattributed": buckets["unattributed"], "unknown": buckets["unknown"],
+         "note": "estimate: each pct-point increase is split evenly among conversations updated since the previous change; "
+                 "unattributed = usage with no claude.ai conversation updated (e.g. Claude Code); "
+                 "unknown = conversation list unavailable at that time; resolution 1 pct point"})
+
+
 def cmd_marks(a):
     out([clean(m) for m in read_marks()[-a.last:]])
 
@@ -267,6 +319,8 @@ def main():
         if name == "diff":
             p.add_argument("--metric", action="append", help="five_hour / seven_day / ...（可重複）")
         p.set_defaults(f=fn)
+    p = sp.add_parser("convs"); p.add_argument("start", nargs="?"); p.add_argument("end", nargs="?")
+    p.add_argument("--top", type=int, default=30); p.set_defaults(f=cmd_convs)
     p = sp.add_parser("marks"); p.add_argument("--last", type=int, default=20); p.set_defaults(f=cmd_marks)
     a = ap.parse_args()
     a.f(a)

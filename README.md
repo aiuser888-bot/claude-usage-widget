@@ -30,6 +30,21 @@ A tiny always-on-top Windows desktop widget that shows your claude.ai plan usage
 - 抓取失敗也會記一筆 `"ok": false`，方便判斷資料缺口
 - `src`：`timer`（定時）、`request`（外部要求）、`start`、`manual`
 
+### 每個對話的用量（估計）
+
+百分比有變動時，小窗會順便抓一次 claude.ai 的對話清單（只取標題、更新時間、模型、平台、執行狀態，**不含對話內容**），把「上次檢查後有動的對話」記在那筆紀錄的 `active_convs`。判斷「有動」的依據：`updated_at` 等活動時間前進，或 `live_status` 為執行中（例如 `running`）。網頁版、手機版、桌面版的對話都會出現在清單裡；不額外消耗 Claude 額度。
+
+```bash
+python usage_query.py convs                 # 最近 24 小時各對話的估計用量
+python usage_query.py convs now-7d now --top 10
+```
+
+- 一次上升只有一個對話在動 → 全部算給它；多個對話同時在動 → 平分，並以 `shared_events` 標示
+- `unattributed`：用量上升但沒有任何對話在動（例如 Claude Code 終端機、API 以外的用途）
+- `unknown`：當時抓不到對話清單
+- 使用的是 claude.ai 未公開的內部 API（`/api/organizations/{org}/chat_conversations`），可能隨時失效；失效時只會記 `conv_error`，不影響用量紀錄本身
+- 標題會存在本機的紀錄檔裡
+
 ### `usage_query.py`：查詢與量測排程前後的消耗
 
 只用 Python 標準函式庫，輸出 JSON。
@@ -45,6 +60,7 @@ python usage_query.py diff now-2h now --metric five_hour
 python usage_query.py at "2026-11-07 09:00"
 python usage_query.py range now-30m now
 python usage_query.py marks --last 10
+python usage_query.py convs                       # 各對話估計用量（見上一節）
 ```
 
 `diff` 會把各區段的百分比上升量加總；中途遇到額度重置（百分比下降）時，以重置後的百分比計入並回報 `resets_in_between`。API 提供的是整數百分比，解析度為 1 個百分點。

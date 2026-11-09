@@ -35,8 +35,18 @@ python3 usage_query.py diff "mark:<任務名>-<YYYYMMDD-HHMM> start" "mark:<任�
 | `at TIME` | 某時間點當下（或之前最近）的一筆 |
 | `range FROM TO` | 區間內所有紀錄 |
 | `marks --last N` | 最近 N 個標記 |
+| `convs [FROM TO] [--top N]` | 各對話的估計用量（預設最近 24 小時） |
 
 FROM／TO／TIME 可寫：`mark:LABEL`、`now`、`now-30m`／`now-2h`／`now-1d`、ISO 時間（如 `"2026-11-07 09:00"`，未寫時區即視為台灣時間 +08:00）。
+
+## 3.5 查每個對話用了多少（不必事先 mark）
+
+```bash
+python3 usage_query.py convs                    # 最近 24 小時
+python3 usage_query.py convs now-7d now --top 10
+```
+輸出 `conversations`（依用量排序，含 `name`、`model`、`used.five_hour`、`events`、`shared_events`）、`unattributed`、`unknown`。
+這是**估計值**：每次百分比上升平分給當時「有動」的對話（活動時間前進或 `live_status` 為 running）；同時多個對話在動時無法精確拆分。
 
 ## 4. 輸出怎麼讀
 

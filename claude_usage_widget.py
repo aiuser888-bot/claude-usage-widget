@@ -8,6 +8,8 @@ https://github.com/aiuser888-bot/claude-usage-widget  ·  MIT License
 - 錯誤寫入 widget.log（不含 sessionKey）；視窗位置等設定存在 claude_usage_state.json
 - 每次更新都把時間與用量寫入 usage_history/usage_YYYY-MM-DD.jsonl（總量上限 500 MB，超過刪最舊的檔）；
   其他程式可用 usage_query.py 查詢，或建立 .refresh_request 要求立即更新
+- 百分比有變動時，順便抓 claude.ai 對話清單（只取標題、更新時間、模型），記下這段期間有動的對話，
+  讓 usage_query.py convs 估算每個對話的用量（使用非公開的內部 API，可能失效；失效時不影響用量紀錄）
 """
 
 import json
@@ -23,7 +25,18 @@ HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "claude_usage_state.json"
 LOG_FILE = HERE / "widget.log"
 SHOW_FLAG = HERE / ".show_request"  # 第二次啟動時建立，通知執行中的小窗回到畫面上
-REFRESH_FLAG = HERE / ".refresh_request"  # 外部程式建立，要求小窗立即更新一次（usage_query.py snapshot 用）
+REFRESH_FLAG = HERE / ".refresh_request"
+PROBE_FLAG = HERE / ".probe_request"  # 外部程式建立，要求小窗測試對話清單 API，結果寫入 probe.json（不含標題）
+PROBE_FILE = HERE / "probe.json"
+CONV_LIMIT = 50
+# 對話「有動」的判斷：這些時間欄位任一前進，或 live_status 不是閒置值
+ACTIVITY_FIELDS = ("updated_at", "latest_assistant_output_at", "last_settled_at", "live_status_started_at")
+IDLE_STATUSES = {"", "none", "idle", "settled", "completed", "complete", "done", "stopped", "error", "failed"}
+CONV_ENDPOINTS = [  # 依序嘗試，第一個回傳對話清單格式者採用
+    "/api/organizations/{org}/chat_conversations?limit={n}",
+    "/api/organizations/{org}/chat_conversations_v2?limit={n}&offset=0",
+    "/api/organizations/{org}/chat_conversations",
+]  # 外部程式建立，要求小窗立即更新一次（usage_query.py snapshot 用）
 HISTORY_DIR = HERE / "usage_history"
 HISTORY_MAX_BYTES = 500 * 1024 * 1024
 
@@ -166,6 +179,100 @@ class UsageClient:
         self.s.cookies.set("sessionKey", session_key, domain=".claude.ai")
         self.org = None
         self.last_raw = {}
+        self.conv_endpoint = None   # 探測到可用的對話清單端點
+        self.conv_baseline = None   # uuid -> updated_at（上次檢查時）
+        self.last_pcts = None
+
+    @staticmethod
+    def _conv_items(data):
+        items = data.get("data") if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            return None
+        if items and not (isinstance(items[0], dict) and "uuid" in items[0] and "updated_at" in items[0]):
+            return None
+        return items
+
+    def conversations(self):
+        """回傳最近更新的對話 [{uuid, name, updated_at, model}]；自動探測可用端點。"""
+        cands = [self.conv_endpoint] if self.conv_endpoint else CONV_ENDPOINTS
+        last_err = None
+        for ep in cands:
+            try:
+                items = self._conv_items(self._get(ep.format(org=self.org, n=CONV_LIMIT)))
+            except AuthError:
+                raise
+            except Exception as e:
+                last_err = e
+                continue
+            if items is None:
+                last_err = RuntimeError(f"unexpected format: {ep}")
+                continue
+            if self.conv_endpoint != ep:
+                log.info("conversation list endpoint: %s", ep.split("?")[0].replace(self.org or "", "{org}"))
+            self.conv_endpoint = ep
+            return [{"uuid": c.get("uuid"), "name": c.get("name") or "", "updated_at": c.get("updated_at"),
+                     "model": c.get("model"), "platform": c.get("platform"), "live_status": c.get("live_status"),
+                     "activity": max(str(c.get(k) or "") for k in ACTIVITY_FIELDS)} for c in items]
+        self.conv_endpoint = None
+        raise RuntimeError(f"conversation list unavailable: {last_err}")
+
+    def changed_conversations(self, raw):
+        """百分比有變動（或第一次）時抓對話清單，回傳 (有動的對話, 錯誤)。百分比沒變回傳 (None, None)。"""
+        pcts = {k: v["pct"] for k, v in raw.items()}
+        first = self.last_pcts is None
+        if not first and pcts == self.last_pcts:
+            return None, None
+        self.last_pcts = pcts
+        try:
+            convs = self.conversations()
+        except AuthError:
+            raise
+        except Exception as e:
+            return None, str(e)
+        now = {c["uuid"]: c["activity"] for c in convs}
+        changed = []
+        if self.conv_baseline is not None:
+            for c in convs:
+                running = str(c.get("live_status") or "").lower() not in IDLE_STATUSES
+                advanced = c["uuid"] not in self.conv_baseline or c["activity"] > (self.conv_baseline[c["uuid"]] or "")
+                if running or advanced:
+                    changed.append({k: c[k] for k in ("uuid", "name", "updated_at", "model", "platform", "live_status")})
+        self.conv_baseline = {**(self.conv_baseline or {}), **now}
+        return (None if first else changed), None
+
+    def probe(self):
+        """測試各候選端點，回傳結構摘要（不含對話標題與內容）。"""
+        res = {"t": datetime.now().astimezone().isoformat(timespec="seconds"), "endpoints": []}
+        for ep in CONV_ENDPOINTS:
+            path = ep.format(org=self.org, n=CONV_LIMIT)
+            item = {"endpoint": ep}
+            try:
+                r = self.s.get(BASE + path, timeout=20, headers={"Accept": "application/json"})
+                item["status"] = r.status_code
+                if r.status_code == 200:
+                    d = r.json()
+                    item["top_type"] = type(d).__name__
+                    if isinstance(d, dict):
+                        item["top_keys"] = sorted(d.keys())[:20]
+                    items = self._conv_items(d)
+                    item["parsed"] = items is not None
+                    if items:
+                        ts = [c.get("updated_at") or "" for c in items]
+                        item.update(count=len(items), item_keys=sorted(items[0].keys()),
+                                    sorted_desc=ts == sorted(ts, reverse=True), newest=max(ts), oldest=min(ts),
+                                    models=sorted({str(c.get("model")) for c in items}),
+                                    empty_names=sum(1 for c in items if not c.get("name")),
+                                    live_statuses=sorted({str(c.get("live_status")) for c in items}),
+                                    platforms=sorted({str(c.get("platform")) for c in items}),
+                                    top=[{"name": (c.get("name") or "")[:20], "platform": c.get("platform"),
+                                          "live_status": c.get("live_status"), "has_session": bool(c.get("session_id") or c.get("workspace_session_id")),
+                                          **{k: c.get(k) for k in ACTIVITY_FIELDS}} for c in items[:6]])
+            except Exception as e:
+                item["error"] = str(e)[:200]
+            res["endpoints"].append(item)
+            if item.get("parsed"):
+                break
+        return res
 
     def _get(self, path):
         r = self.s.get(BASE + path, timeout=20, headers={"Accept": "application/json"})
@@ -267,6 +374,7 @@ class Widget:
         self.fetching = False
         self.had_error = False
         self.history = UsageHistory()
+        self.probe_pending = False
         self.fetch_src = "timer"
         st = load_json(STATE_FILE, {})
         self.collapsed = st.get("collapsed", False)
@@ -320,18 +428,30 @@ class Widget:
         threading.Thread(target=self._fetch, daemon=True).start()
 
     def _fetch(self):
-        raw = {}
+        raw, conv = {}, {}
         try:
             rows, err = self.client.usage(), None
             raw = dict(self.client.last_raw)
+            changed, cerr = self.client.changed_conversations(raw)
+            if cerr:
+                conv = {"conv_error": cerr}
+            elif changed is not None:
+                conv = {"active_convs": changed}
         except Exception as e:
             rows, err = self.rows, e
-        self.root.after(0, self._apply, rows, err, raw)
+        if self.probe_pending:
+            self.probe_pending = False
+            try:
+                PROBE_FILE.write_text(json.dumps(self.client.probe(), ensure_ascii=False, indent=1), encoding="utf-8")
+            except Exception as e:
+                log.exception("probe failed")
+                save_json(PROBE_FILE, {"error": str(e)})
+        self.root.after(0, self._apply, rows, err, raw, conv)
 
-    def _apply(self, rows, err, raw=None):
+    def _apply(self, rows, err, raw=None, conv=None):
         self.fetching = False
         self.history.append({"t": datetime.now().astimezone().isoformat(timespec="seconds"), "ok": err is None,
-                             "src": self.fetch_src, "usage": raw or {}, "error": str(err) if err else None})
+                             "src": self.fetch_src, "usage": raw or {}, **(conv or {}), "error": str(err) if err else None})
         self.fetch_src = "timer"
         self.rows = rows
         self.err = str(err) if err else None
@@ -371,7 +491,7 @@ class Widget:
 
     def _poll_flags(self):
         """每秒檢查外部請求：.show_request（重複啟動）、.refresh_request（立即更新）。"""
-        for flag in (SHOW_FLAG, REFRESH_FLAG):
+        for flag in (SHOW_FLAG, REFRESH_FLAG, PROBE_FLAG):
             if flag.exists():
                 try:
                     flag.unlink()
@@ -380,6 +500,9 @@ class Widget:
                 if flag is SHOW_FLAG:
                     log.info("show request from second launch")
                     self.reset_position()
+                elif flag is PROBE_FLAG:
+                    self.probe_pending = True
+                    self.refresh("probe")
                 else:
                     self.refresh("request")
         self.root.after(1000, self._poll_flags)

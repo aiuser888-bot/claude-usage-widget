@@ -8,3 +8,5 @@ setup.log
 .show_request
 usage_history/
 .refresh_request
+.probe_request
+probe.json
