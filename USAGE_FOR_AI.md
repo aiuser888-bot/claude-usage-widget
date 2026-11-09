@@ -5,16 +5,16 @@
 
 ## 1. 前提
 
-- 這個對話必須連到使用者的電腦，而且已連接 `C:\Users\AI\Desktop\ClaudeWork` 資料夾。
+- 這個對話必須連到使用者的電腦，而且已連接「放有 `ClaudeUsageWidget` 程式資料夾的那個上層資料夾」（以下稱 `<資料夾>`）。
 - 在 `device_bash`（電腦上的 Linux shell）裡，程式資料夾路徑是：
-  `$HOME/mnt/ClaudeWork/ClaudeUsageWidget`
+  `$HOME/mnt/<資料夾>/ClaudeUsageWidget`（`<資料夾>` 換成實際連接的資料夾名稱，可用 `ls $HOME/mnt` 查看）
 - 用 `python3` 執行（只用標準函式庫，免安裝）。
 - 小窗必須在執行中，`mark`／`snapshot` 才能拿到即時數字（開機會自動啟動）。
 
 ## 2. 量測一個任務的用量（標準流程）
 
 ```bash
-cd "$HOME/mnt/ClaudeWork/ClaudeUsageWidget"
+cd "$HOME/mnt/<資料夾>/ClaudeUsageWidget"
 python3 usage_query.py mark "<任務名>-<YYYYMMDD-HHMM> start"
 #  ……執行任務……
 python3 usage_query.py mark "<任務名>-<YYYYMMDD-HHMM> end"
@@ -83,6 +83,6 @@ python3 usage_query.py convs now-7d now --top 10
 | `no new record within 30s` | 小窗沒在執行。請使用者雙擊桌面「啟動用量小窗」 |
 | `latest` 的 `age_seconds` 遠大於 60 | 同上，或電腦剛從睡眠喚醒 |
 | 紀錄裡的 `error` 出現「驗證失敗」 | sessionKey 過期，請使用者在小窗右鍵 →「更換 sessionKey」 |
-| 找不到 `$HOME/mnt/ClaudeWork` | 這個對話沒有連接 ClaudeWork 資料夾，請使用者加入 |
+| 找不到 `$HOME/mnt/<資料夾>/ClaudeUsageWidget` | 這個對話沒有連接該資料夾，請使用者加入 |
 
 原始碼與說明：https://github.com/aiuser888-bot/claude-usage-widget
